@@ -29,6 +29,11 @@ type Config struct {
 	GHAppPrivateKey     []byte
 	GHAppPrivateKeyPath string
 	Organization        string
+	// BulkClusterSync enables the async cluster job endpoint for startup
+	// state sync. When false, startup sync is skipped and only individual
+	// PostOne calls are used. **Note: this is experimental and not yet available
+	// for public use.**
+	BulkClusterSync bool
 }
 
 // ValidTemplate verifies that at least one placeholder is present

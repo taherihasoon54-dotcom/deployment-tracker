@@ -26,19 +26,27 @@ import (
 
 type mockRecordPoster struct {
 	mu      sync.Mutex
-	records []*deploymentrecord.DeploymentRecord
+	records []*deploymentrecord.Record
 	err     error // to simulate failures
 }
 
-func (m *mockRecordPoster) PostOne(_ context.Context, record *deploymentrecord.DeploymentRecord) error {
+func (m *mockRecordPoster) PostOne(_ context.Context, record *deploymentrecord.Record) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.records = append(m.records, record)
 	return m.err
 }
 
+func (m *mockRecordPoster) CreateClusterJob(_ context.Context, _ []*deploymentrecord.Record, _ string) (*deploymentrecord.JobResponse, error) {
+	return &deploymentrecord.JobResponse{}, nil
+}
+
+func (m *mockRecordPoster) WaitForClusterJob(_ context.Context, _ string, _ int64) (*deploymentrecord.JobStatus, error) {
+	return &deploymentrecord.JobStatus{Status: "completed"}, nil
+}
+
 // Helper that allows tests to read captured records safely.
-func (m *mockRecordPoster) getRecords() []*deploymentrecord.DeploymentRecord {
+func (m *mockRecordPoster) getRecords() []*deploymentrecord.Record {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return slices.Clone(m.records)

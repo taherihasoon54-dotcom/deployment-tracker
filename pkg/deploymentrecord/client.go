@@ -11,6 +11,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -164,6 +165,34 @@ func (c *ClientError) Unwrap() error {
 	return c.err
 }
 
+// ClusterNoRepositoriesError represents a 404 response from the cluster endpoint
+// indicating no repositories were found for the given cluster.
+type ClusterNoRepositoriesError struct {
+	err error
+}
+
+func (c *ClusterNoRepositoriesError) Error() string {
+	return fmt.Sprintf("cluster_no_repositories_error: %s", c.err.Error())
+}
+
+func (c *ClusterNoRepositoriesError) Unwrap() error {
+	return c.err
+}
+
+// ClusterJobConflictError represents a 409 response indicating a job is already
+// pending or processing for this cluster and environment.
+type ClusterJobConflictError struct {
+	err error
+}
+
+func (c *ClusterJobConflictError) Error() string {
+	return fmt.Sprintf("cluster_job_conflict_error: %s", c.err.Error())
+}
+
+func (c *ClusterJobConflictError) Unwrap() error {
+	return c.err
+}
+
 // NoArtifactError represents a 404 client response whose body indicates "no artifacts found".
 type NoArtifactError struct {
 	err error
@@ -182,50 +211,195 @@ func (n *NoArtifactError) Unwrap() error {
 
 // PostOne posts a single deployment record to the GitHub deployment
 // records API.
-func (c *Client) PostOne(ctx context.Context, record *DeploymentRecord) error {
+func (c *Client) PostOne(ctx context.Context, record *Record) error {
 	if record == nil {
 		return errors.New("record cannot be nil")
 	}
 
-	url := fmt.Sprintf("%s/orgs/%s/artifacts/metadata/deployment-record", c.baseURL, c.org)
+	singleURL := fmt.Sprintf("%s/orgs/%s/artifacts/metadata/deployment-record", c.baseURL, c.org)
 
 	body, err := buildRequestBody(record)
 	if err != nil {
 		return fmt.Errorf("failed to marshal record: %w", err)
 	}
 
-	bodyReader := bytes.NewReader(body)
+	respBody, statusCode, lastErr := c.doWithRetry(ctx, http.MethodPost, singleURL, body)
 
+	var clientErr *ClientError
+	switch {
+	case errors.As(lastErr, &clientErr):
+		dtmetrics.PostDeploymentRecordClientError.Inc()
+		slog.Warn("client error, aborting",
+			"status_code", statusCode,
+			"url", singleURL,
+			"resp_msg", string(respBody),
+		)
+		return fmt.Errorf("client error: %w", lastErr)
+	case statusCode >= 200 && statusCode < 300:
+		dtmetrics.PostDeploymentRecordOk.Inc()
+		return nil
+	case statusCode == 404:
+		dtmetrics.PostDeploymentRecordUnknownArtifact.Inc()
+		slog.Debug("no artifact attestation found, no record created",
+			"status_code", statusCode,
+			"container_name", record.Name,
+			"resp_msg", string(respBody),
+			"digest", record.Digest,
+		)
+		return &NoArtifactError{err: fmt.Errorf("no attestation found for %s", record.Digest)}
+	default:
+		dtmetrics.PostDeploymentRecordHardFail.Inc()
+		slog.Error("all retries exhausted",
+			"count", c.retries,
+			"error", lastErr,
+			"container_name", record.Name,
+		)
+		return fmt.Errorf("all retries exhausted: %w", lastErr)
+	}
+}
+
+// CreateClusterJob submits the full cluster state as an async job.
+// Returns the job response (including job ID) and any authorization errors
+// for rejected deployments.
+func (c *Client) CreateClusterJob(ctx context.Context, records []*Record, cluster string) (*JobResponse, error) {
+	if len(records) == 0 {
+		return nil, errors.New("records cannot be empty")
+	}
+
+	jobURL := fmt.Sprintf("%s/orgs/%s/artifacts/metadata/deployment-record/cluster/%s/jobs",
+		c.baseURL, c.org, url.PathEscape(cluster))
+
+	body, err := buildClusterRequestBody(records)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal records: %w", err)
+	}
+
+	respBody, statusCode, lastErr := c.doWithRetry(ctx, http.MethodPost, jobURL, body)
+
+	switch {
+	case statusCode == 409:
+		return nil, &ClusterJobConflictError{err: errors.New("a job is already pending or processing for this cluster")}
+	case statusCode == 404:
+		dtmetrics.PostDeploymentRecordUnknownArtifact.Inc()
+		return nil, &ClusterNoRepositoriesError{err: errors.New("async endpoint not available")}
+	case lastErr != nil:
+		var clientErr *ClientError
+		if errors.As(lastErr, &clientErr) {
+			dtmetrics.PostDeploymentRecordClientError.Inc()
+		} else {
+			dtmetrics.PostDeploymentRecordHardFail.Inc()
+		}
+		return nil, fmt.Errorf("cluster job creation failed: %w", lastErr)
+	case statusCode >= 200 && statusCode < 300:
+		dtmetrics.PostDeploymentRecordOk.Inc()
+		var jobResp JobResponse
+		if err := json.Unmarshal(respBody, &jobResp); err != nil {
+			return nil, fmt.Errorf("failed to parse job response: %w", err)
+		}
+		return &jobResp, nil
+	default:
+		dtmetrics.PostDeploymentRecordHardFail.Inc()
+		return nil, fmt.Errorf("unexpected status code %d", statusCode)
+	}
+}
+
+// GetClusterJobStatus retrieves the current status of an async cluster job.
+func (c *Client) GetClusterJobStatus(ctx context.Context, cluster string, jobID int64) (*JobStatus, error) {
+	jobURL := fmt.Sprintf("%s/orgs/%s/artifacts/metadata/deployment-record/cluster/%s/jobs/%d",
+		c.baseURL, c.org, url.PathEscape(cluster), jobID)
+
+	respBody, statusCode, lastErr := c.doWithRetry(ctx, http.MethodGet, jobURL, nil)
+
+	switch {
+	case lastErr != nil:
+		return nil, fmt.Errorf("failed to get job status: %w", lastErr)
+	case statusCode == 404:
+		return nil, fmt.Errorf("job %d not found", jobID)
+	case statusCode >= 200 && statusCode < 300:
+		var status JobStatus
+		if err := json.Unmarshal(respBody, &status); err != nil {
+			return nil, fmt.Errorf("failed to parse job status: %w", err)
+		}
+		return &status, nil
+	default:
+		return nil, fmt.Errorf("unexpected status code %d", statusCode)
+	}
+}
+
+// WaitForClusterJob polls GetClusterJobStatus until the job reaches a terminal
+// state (completed or failed). Uses exponential backoff between polls.
+func (c *Client) WaitForClusterJob(ctx context.Context, cluster string, jobID int64) (*JobStatus, error) {
+	const initialDelay = 2 * time.Second
+	const maxDelay = 30 * time.Second
+
+	for attempt := 0; ; attempt++ {
+		status, err := c.GetClusterJobStatus(ctx, cluster, jobID)
+		if err != nil {
+			return nil, fmt.Errorf("polling job %d: %w", jobID, err)
+		}
+		if status.Status == "completed" || status.Status == "failed" {
+			return status, nil
+		}
+
+		delay := time.Duration(math.Min(
+			float64(initialDelay)*math.Pow(2, float64(attempt)),
+			float64(maxDelay),
+		))
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (c *Client) doWithRetry(ctx context.Context, method, targetURL string, body []byte) ([]byte, int, error) {
+	var bodyReader *bytes.Reader
+	if body != nil {
+		bodyReader = bytes.NewReader(body)
+	}
 	var lastErr error
 	// The first attempt is not a retry!
 	for attempt := range c.retries + 1 {
-		if err = waitForBackoff(ctx, attempt); err != nil {
-			return err
+		if err := waitForBackoff(ctx, attempt); err != nil {
+			return nil, 0, err
 		}
 
-		if err = c.waitForServerRateLimit(ctx); err != nil {
-			return err
+		if err := c.waitForServerRateLimit(ctx); err != nil {
+			return nil, 0, err
 		}
 
-		if err = c.requestThrottler.Wait(ctx); err != nil {
-			return fmt.Errorf("request throttler wait failed: %w", err)
+		if err := c.requestThrottler.Wait(ctx); err != nil {
+			return nil, 0, fmt.Errorf("request throttler wait failed: %w", err)
 		}
 
 		// Reset reader position for retries
-		bodyReader.Reset(body)
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bodyReader)
-		if err != nil {
-			return fmt.Errorf("failed to create request: %w", err)
+		if bodyReader != nil {
+			bodyReader.Reset(body)
 		}
 
-		req.Header.Set("Content-Type", "application/json")
+		var reqBody io.Reader
+		if bodyReader != nil {
+			reqBody = bodyReader
+		}
+
+		req, err := http.NewRequestWithContext(ctx, method, targetURL, reqBody)
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to create request: %w", err)
+		}
+
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
 		if c.transport != nil {
 			// Token is thread safe, so no need for external
 			// locking
 			tok, err := c.transport.Token(ctx)
 			if err != nil {
-				return fmt.Errorf("failed to get access token: %w", err)
+				return nil, 0, fmt.Errorf("failed to get access token: %w", err)
 			}
 			req.Header.Set("Authorization", "Bearer "+tok)
 		} else if c.apiToken != "" {
@@ -239,7 +413,7 @@ func (c *Client) PostOne(ctx context.Context, record *DeploymentRecord) error {
 		dur := time.Since(start)
 		dtmetrics.PostDeploymentRecordTimer.Observe(dur.Seconds())
 		if err != nil {
-			lastErr = fmt.Errorf("post request failed: %w", err)
+			lastErr = fmt.Errorf("request failed: %w", err)
 
 			slog.Warn("recoverable error, re-trying",
 				"attempt", attempt,
@@ -249,31 +423,20 @@ func (c *Client) PostOne(ctx context.Context, record *DeploymentRecord) error {
 			continue
 		}
 
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			// Drain and close response body to enable connection reuse
-			_, _ = io.Copy(io.Discard, resp.Body)
-			_ = resp.Body.Close()
-			dtmetrics.PostDeploymentRecordOk.Inc()
-			return nil
-		}
-
-		// Drain and close response body to enable connection reuse by reading body for error logging
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		_, _ = io.Copy(io.Discard, resp.Body)
+		// Drain and close response body to enable connection reuse.
+		// Limit to 10MB to prevent unbounded memory allocation.
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
 		_ = resp.Body.Close()
 
 		switch {
+		case resp.StatusCode >= 200 && resp.StatusCode < 300:
+			return respBody, resp.StatusCode, nil
 		case resp.StatusCode == 404:
-			// No artifact found - do not retry
-			dtmetrics.PostDeploymentRecordUnknownArtifact.Inc()
-			slog.Debug("no artifact attestation found, no record created",
-				"attempt", attempt,
-				"status_code", resp.StatusCode,
-				"container_name", record.Name,
-				"resp_msg", string(respBody),
-				"digest", record.Digest,
-			)
-			return &NoArtifactError{err: fmt.Errorf("no attestation found for %s", record.Digest)}
+			// Not found - do not retry
+			return respBody, resp.StatusCode, nil
+		case resp.StatusCode == 409:
+			// Conflict - do not retry
+			return respBody, resp.StatusCode, nil
 		case resp.StatusCode >= 400 && resp.StatusCode < 500:
 			// Check headers that indicate rate limiting
 			if resp.Header.Get("Retry-After") != "" || resp.Header.Get("X-Ratelimit-Remaining") == "0" {
@@ -286,41 +449,32 @@ func (c *Client) PostOne(ctx context.Context, record *DeploymentRecord) error {
 					"retry-after", resp.Header.Get("Retry-After"),
 					"x-ratelimit-remaining", resp.Header.Get("X-Ratelimit-Remaining"),
 					"retry_delay", retryDelay.Seconds(),
-					"container_name", record.Name,
+					"url", targetURL,
 					"resp_msg", string(respBody),
 				)
 				lastErr = fmt.Errorf("rate limited, attempt %d", attempt)
 				continue
 			}
 			// Don't retry non rate limiting client errors
-			dtmetrics.PostDeploymentRecordClientError.Inc()
 			slog.Warn("client error, aborting",
 				"attempt", attempt,
 				"status_code", resp.StatusCode,
-				"container_name", record.Name,
 				"resp_msg", string(respBody),
 			)
-			return &ClientError{err: fmt.Errorf("unexpected client err with status code %d", resp.StatusCode)}
+			return respBody, resp.StatusCode, &ClientError{err: fmt.Errorf("unexpected client err with status code %d", resp.StatusCode)}
 		default:
 			// Retry with backoff
 			dtmetrics.PostDeploymentRecordSoftFail.Inc()
 			slog.Debug("retriable error",
 				"attempt", attempt,
 				"status_code", resp.StatusCode,
-				"container_name", record.Name,
+				"url", targetURL,
 				"resp_msg", string(respBody),
 			)
 			lastErr = fmt.Errorf("server error, attempt %d", attempt)
 		}
 	}
-
-	dtmetrics.PostDeploymentRecordHardFail.Inc()
-	slog.Error("all retries exhausted",
-		"count", c.retries,
-		"error", lastErr,
-		"container_name", record.Name,
-	)
-	return fmt.Errorf("all retries exhausted: %w", lastErr)
+	return nil, 0, lastErr
 }
 
 // waitForServerRateLimit blocks until the global server rate limit backoff has elapsed.
@@ -400,13 +554,40 @@ func parseRateLimitDelay(resp *http.Response) time.Duration {
 
 // buildRequestBody adds return_records=false to a deployment record request body
 // which results in a minimal response payload.
-func buildRequestBody(record *DeploymentRecord) ([]byte, error) {
+func buildRequestBody(record *Record) ([]byte, error) {
 	return json.Marshal(struct {
-		DeploymentRecord
+		Record
 		ReturnRecords bool `json:"return_records"`
 	}{
-		DeploymentRecord: *record,
-		ReturnRecords:    false,
+		Record:        *record,
+		ReturnRecords: false,
+	})
+}
+
+// buildClusterRequestBody count the total records, builds ClusterRecordsBody,
+// and returns []byte.
+func buildClusterRequestBody(records []*Record) ([]byte, error) {
+	if len(records) == 0 {
+		return nil, nil
+	}
+	deploymentRecords := []BaseRecord{}
+
+	for _, r := range records {
+		if r == nil {
+			continue
+		}
+		deploymentRecords = append(deploymentRecords, r.BaseRecord)
+	}
+
+	if len(deploymentRecords) == 0 {
+		return nil, nil
+	}
+
+	return json.Marshal(ClusterRecordsBody{
+		LogicalEnvironment:  records[0].LogicalEnvironment,
+		PhysicalEnvironment: records[0].PhysicalEnvironment,
+		PartialSuccess:      true,
+		Deployments:         deploymentRecords,
 	})
 }
 

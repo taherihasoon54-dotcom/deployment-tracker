@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/github/deployment-tracker/internal/metadata"
 	"github.com/github/deployment-tracker/internal/workload"
 	"github.com/github/deployment-tracker/pkg/deploymentrecord"
 	"github.com/stretchr/testify/assert"
@@ -23,33 +24,76 @@ import (
 
 // mockPoster records all PostOne calls and returns a configurable error.
 type mockPoster struct {
-	mu      sync.Mutex
-	calls   int
-	lastErr error
+	mu                 sync.Mutex
+	calls              int
+	clusterRecordCount int
+	jobCalls           int
+	jobWaitCalls       int
+	lastErr            error
+	jobResp            *deploymentrecord.JobResponse
+	jobErr             error
+	jobStatus          *deploymentrecord.JobStatus
+	jobWaitErr         error
 }
 
-func (m *mockPoster) PostOne(_ context.Context, _ *deploymentrecord.DeploymentRecord) error {
+func (m *mockPoster) PostOne(_ context.Context, _ *deploymentrecord.Record) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.calls++
 	return m.lastErr
 }
 
-func (m *mockPoster) getCalls() int {
+func (m *mockPoster) CreateClusterJob(_ context.Context, records []*deploymentrecord.Record, _ string) (*deploymentrecord.JobResponse, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.jobCalls++
+	m.clusterRecordCount = len(records)
+	return m.jobResp, m.jobErr
+}
+
+func (m *mockPoster) WaitForClusterJob(_ context.Context, _ string, _ int64) (*deploymentrecord.JobStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.jobWaitCalls++
+	return m.jobStatus, m.jobWaitErr
+}
+
+func (m *mockPoster) getPostOneCalls() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.calls
 }
 
-// mockResolver is a test double for the workloadResolver interface.
-type mockResolver struct{}
+func (m *mockPoster) getCreateClusterJobCalls() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.jobCalls
+}
 
-func (*mockResolver) Resolve(_ *corev1.Pod) workload.Identity {
-	return workload.Identity{}
+func (m *mockPoster) getWaitForClusterJobCalls() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.jobWaitCalls
+}
+
+// mockResolver is a test double for the workloadResolver interface.
+type mockResolver struct {
+	name string
+}
+
+func (m *mockResolver) Resolve(_ *corev1.Pod) workload.Identity {
+	return workload.Identity{Name: m.name}
 }
 
 func (*mockResolver) IsActive(_ string, _ workload.Identity) bool {
 	return false
+}
+
+// mockMetadataAggregator is a test double for the podMetadataAggregator interface.
+type mockMetadataAggregator struct{}
+
+func (*mockMetadataAggregator) BuildAggregatePodMetadata(_ context.Context, _ *metav1.PartialObjectMetadata) *metadata.AggregatePodMetadata {
+	return nil
 }
 
 // newTestController creates a minimal Controller suitable for unit-testing
@@ -62,8 +106,10 @@ func newTestController(poster *mockPoster) *Controller {
 			LogicalEnvironment:  "test",
 			PhysicalEnvironment: "test",
 			Cluster:             "test",
+			BulkClusterSync:     true,
 		},
 		workloadResolver:    &mockResolver{},
+		metadataAggregator:  &mockMetadataAggregator{},
 		observedDeployments: amcache.NewExpiring(),
 		unknownArtifacts:    amcache.NewExpiring(),
 	}

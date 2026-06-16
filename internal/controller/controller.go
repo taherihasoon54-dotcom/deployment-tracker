@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/github/deployment-tracker/internal/metadata"
@@ -47,7 +48,9 @@ type ttlCache interface {
 }
 
 type deploymentRecordPoster interface {
-	PostOne(ctx context.Context, record *deploymentrecord.DeploymentRecord) error
+	PostOne(ctx context.Context, record *deploymentrecord.Record) error
+	CreateClusterJob(ctx context.Context, records []*deploymentrecord.Record, cluster string) (*deploymentrecord.JobResponse, error)
+	WaitForClusterJob(ctx context.Context, cluster string, jobID int64) (*deploymentrecord.JobStatus, error)
 }
 
 type podMetadataAggregator interface {
@@ -87,6 +90,11 @@ type Controller struct {
 	// informerSyncTimeout is the maximum time allowed for all informers to sync
 	// and prevents sync from hanging indefinitely.
 	informerSyncTimeout time.Duration
+	// syncing gates informer event handlers during startup. When true,
+	// pod add events are suppressed so they can be reported via the bulk
+	// cluster job instead of individual PostOne calls. Only set when
+	// BulkClusterSync is enabled.
+	syncing atomic.Bool
 }
 
 // New creates a new deployment tracker controller.
@@ -147,10 +155,21 @@ func New(clientset kubernetes.Interface, metadataAggregator podMetadataAggregato
 		unknownArtifacts:    amcache.NewExpiring(),
 		informerSyncTimeout: informerSyncTimeoutDuration,
 	}
+	// Only gate informer events when bulk cluster sync is enabled.
+	// When disabled, all pods discovered during informer sync will be
+	// enqueued as individual events.
+	if cfg.BulkClusterSync {
+		cntrl.syncing.Store(true)
+	}
 
 	// Add event handlers to the informer
 	_, err = podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj any) {
+			// Skip adding sync events
+			if cntrl.syncing.Load() {
+				return
+			}
+
 			pod, ok := obj.(*corev1.Pod)
 			if !ok {
 				slog.Error("Invalid object returned",
@@ -313,6 +332,12 @@ func (c *Controller) Run(ctx context.Context, workers int) error {
 			}
 			return errors.New("timed out waiting for caches to sync - please ensure deployment tracker has the correct kubernetes permissions")
 		}
+	}
+	c.syncing.Store(false)
+	syncClusterPods := c.podInformer.GetIndexer().List()
+	err := c.processSyncEvents(ctx, syncClusterPods)
+	if err != nil {
+		return fmt.Errorf("sync events failed: %w", err)
 	}
 
 	slog.Info("Starting workers",
